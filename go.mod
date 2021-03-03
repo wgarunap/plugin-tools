@@ -1,4 +1,4 @@
-module github.com/devopsfaith/plugin-tools
+module github.com/wgarunap/plugin-tools
 
 go 1.15
 
