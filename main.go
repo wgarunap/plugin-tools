@@ -2,99 +2,190 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/olekukonko/tablewriter"
+	"github.com/spf13/cobra"
+)
+
+var (
+	validateCmd = &cobra.Command{
+		Use:   "validate",
+		Short: "A validator for krakend plugins",
+		Run:   Validate,
+	}
+	serverCmd = &cobra.Command{
+		Use:   "serve",
+		Short: "serve interactive web server for krakend plugin validation",
+		Run:   Serve,
+	}
+)
+
+var (
+	//local execution flags
+	krakendVersion string
+	goVersion      string
+	gosumFilePath  string
+
+	//server flags
+	serverPort int
+
+	//krakend version storage
+	versions map[string]Version
 )
 
 func main() {
-	versions, _ := getVersionDeps()
+	validateCmd.PersistentFlags().StringVarP(&krakendVersion, "krakendv", "k", "", "krakend version to be validate against")
+	validateCmd.PersistentFlags().StringVarP(&goVersion, "goversion", "g", "", "golang version to be compared")
+	validateCmd.PersistentFlags().StringVarP(&gosumFilePath, "gosum", "s", "", "path to the plugin go.sum file")
 
+	validateCmd.MarkPersistentFlagRequired("krakendv")
+	validateCmd.MarkPersistentFlagRequired("goversion")
+	validateCmd.MarkPersistentFlagRequired("gosum")
+
+	serverCmd.PersistentFlags().IntVarP(&serverPort, "port", "p", 8080, "server host port while running the ui mode")
+
+	versions, _ = getVersionDeps()
+
+	rootCmd := &cobra.Command{Use: ""}
+	rootCmd.AddCommand(serverCmd, validateCmd)
+	rootCmd.Execute()
+}
+
+func Validate(cmd *cobra.Command, args []string) {
+	a, ok := versions[krakendVersion]
+	if !ok {
+		log.Println("[ERROR] incorrect krakend version received")
+		return
+	}
+	file, err := ioutil.ReadFile(gosumFilePath)
+	if err != nil {
+		log.Println("[ERROR] unable to read " + gosumFilePath + " file")
+		return
+	}
+
+	diffs := checkLines(a, goVersion, parseSumFile(bytes.NewBuffer(file)))
+	if len(diffs) > 0 {
+		printDiff(diffs)
+		os.Exit(1)
+	}
+
+	os.Exit(0)
+}
+
+func printDiff(diff []Diff) {
+	table := tablewriter.NewWriter(os.Stdout)
+
+	var data [][]string
+	for _, d := range diff {
+		data = append(data, []string{d.Name, d.Expected, d.Have})
+	}
+
+	table.SetHeader([]string{"Name", "Expected", "Have"})
+	table.AppendBulk(data)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+
+	table.Render()
+}
+
+func Serve(cmd *cobra.Command, args []string) {
 	e := gin.Default()
 
 	// bind website
-	{
-		e.LoadHTMLFiles("finder.html", "validator.html")
-
-		e.GET("/validate", func(c *gin.Context) {
-			c.HTML(http.StatusOK, "validator.html", ValidateResponse{
-				GoVersion:      "1.15.8",
-				KrakendVersion: "v1.3.0",
-			})
-		})
-
-		e.POST("/validate/:krakend_version/:go_version", func(c *gin.Context) {
-			version := c.Param("krakend_version")
-			goVersion := c.Param("go_version")
-			a, ok := versions[version]
-			if !ok {
-				c.AbortWithStatus(404)
-				return
-			}
-			diffs := checkLines(a, goVersion, parseSumFile(c.Request.Body))
-
-			c.HTML(http.StatusOK, "validator.html", ValidateResponse{
-				GoVersion:      goVersion,
-				KrakendVersion: version,
-				Result:         diffs,
-			})
-		})
-
-		e.GET("/versions/:version", func(c *gin.Context) {
-			version := c.Param("version")
-			if v, ok := versions[version]; ok {
-				c.HTML(http.StatusOK, "finder.html", VersionResponse{Name: version, Version: v})
-				return
-			}
-			c.AbortWithStatus(404)
-		})
-
-		e.GET("/", func(c *gin.Context) {
-			c.HTML(http.StatusOK, "finder.html", VersionResponse{Name: "v1.3.0", Version: versions["v1.3.0"]})
-		})
-	}
+	bindWebsite(e)
 
 	// bind api
-	{
-		e.GET("/api/versions/:version", func(c *gin.Context) {
-			version := c.Param("version")
-			if v, ok := versions[version]; ok {
-				c.JSON(200, v)
-				return
-			}
+	bindApi(e)
+
+	e.Run(fmt.Sprintf(":%d", serverPort))
+}
+
+func bindWebsite(e *gin.Engine) {
+
+	e.LoadHTMLFiles("finder.html", "validator.html")
+
+	e.GET("/validate", func(c *gin.Context) {
+		c.HTML(http.StatusOK, "validator.html", ValidateResponse{
+			GoVersion:      "1.15.8",
+			KrakendVersion: "v1.3.0",
+		})
+	})
+
+	e.POST("/validate/:krakend_version/:go_version", func(c *gin.Context) {
+		version := c.Param("krakend_version")
+		goVersion := c.Param("go_version")
+		a, ok := versions[version]
+		if !ok {
 			c.AbortWithStatus(404)
+			return
+		}
+		diffs := checkLines(a, goVersion, parseSumFile(c.Request.Body))
+
+		c.HTML(http.StatusOK, "validator.html", ValidateResponse{
+			GoVersion:      goVersion,
+			KrakendVersion: version,
+			Result:         diffs,
 		})
+	})
 
-		e.GET("/api/versions", func(c *gin.Context) {
-			c.JSON(200, versions)
-		})
+	e.GET("/versions/:version", func(c *gin.Context) {
+		version := c.Param("version")
+		if v, ok := versions[version]; ok {
+			c.HTML(http.StatusOK, "finder.html", VersionResponse{Name: version, Version: v})
+			return
+		}
+		c.AbortWithStatus(404)
+	})
 
-		e.POST("/api/versions/:krakend_version/:go_version", func(c *gin.Context) {
-			version := c.Param("krakend_version")
-			goVersion := c.Param("go_version")
-			a, ok := versions[version]
-			if !ok {
-				c.AbortWithStatus(404)
-				return
-			}
-			diffs := checkLines(a, goVersion, parseSumFile(c.Request.Body))
-			if len(diffs) == 0 {
-				c.JSON(200, []string{})
-				return
-			}
+	e.GET("/", func(c *gin.Context) {
+		c.HTML(http.StatusOK, "finder.html", VersionResponse{Name: "v1.3.0", Version: versions["v1.3.0"]})
+	})
 
-			c.JSON(400, diffs)
+}
 
-		})
-	}
-	e.Run(":8080")
+func bindApi(e *gin.Engine) {
+
+	e.GET("/api/versions/:version", func(c *gin.Context) {
+		version := c.Param("version")
+		if v, ok := versions[version]; ok {
+			c.JSON(200, v)
+			return
+		}
+		c.AbortWithStatus(404)
+	})
+
+	e.GET("/api/versions", func(c *gin.Context) {
+		c.JSON(200, versions)
+	})
+
+	e.POST("/api/versions/:krakend_version/:go_version", func(c *gin.Context) {
+		version := c.Param("krakend_version")
+		goVersion := c.Param("go_version")
+		a, ok := versions[version]
+		if !ok {
+			c.AbortWithStatus(404)
+			return
+		}
+		diffs := checkLines(a, goVersion, parseSumFile(c.Request.Body))
+		if len(diffs) == 0 {
+			c.JSON(200, []string{})
+			return
+		}
+
+		c.JSON(400, diffs)
+
+	})
+
 }
 
 func checkLines(version Version, goVersion string, lines []string) []Diff {
